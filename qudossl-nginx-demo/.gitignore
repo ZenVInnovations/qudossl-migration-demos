@@ -1,0 +1,19 @@
+# Build output
+target/
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# Never commit certificates, keys, or QudoSSL binaries/licenses
+certs/*.crt
+certs/*.key
+certs/*.pem
+*.p12
+*.pfx
+opt/
+qudossl-commercial-*.tar.gz*
+
+# Editor / OS noise
+.idea/
+*.iml
+.vscode/
+.DS_Store

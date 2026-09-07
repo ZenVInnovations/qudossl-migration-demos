@@ -1,0 +1,5 @@
+# Test certificates and keys are generated LOCALLY by
+# scripts/generate-test-certificate.sh and must never be committed.
+# This keeps the certs/ directory in the repo while ignoring its contents.
+*
+!.gitignore

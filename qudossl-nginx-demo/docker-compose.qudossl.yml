@@ -1,0 +1,43 @@
+# AFTER (STANDARD build) — post-quantum TLS termination on QudoSSL.
+#
+#   docker compose -f docker-compose.qudossl.yml up -d --build
+#   ./scripts/verify-qudossl.sh
+#
+# Same Spring Boot app, same certificate. The ONLY difference from the baseline
+# is the nginx image: it is BUILT AGAINST QudoSSL (nginx/Dockerfile.qudossl) and
+# loads the STANDARD provider config, so it offers the ML-KEM hybrid groups.
+# The one added config line lives in nginx/conf.d/qudossl.conf.
+#
+# For the FIPS build instead, use docker-compose.qudossl-fips.yml.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qudossl-nginx-demo-app:1.0.0
+    container_name: nginx-demo-app
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile.qudossl
+    image: qudossl-nginx-demo-proxy:1.0.0     # shared with the FIPS compose
+    container_name: nginx-demo-proxy
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      # STANDARD build: default provider. (FIPS compose overrides this.)
+      OPENSSL_CONF: /opt/qudossl/ssl/openssl.cnf
+    ports:
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # The QudoSSL server block is mounted in place of the baseline one.
+      - ./nginx/conf.d/qudossl.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    restart: unless-stopped

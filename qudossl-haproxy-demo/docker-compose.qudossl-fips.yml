@@ -1,0 +1,40 @@
+# AFTER (FIPS build) — post-quantum TLS termination on the QudoSSL FIPS module.
+#
+#   docker compose -f docker-compose.qudossl-fips.yml up -d --build
+#   ./scripts/verify-qudossl.sh --fips
+#
+# Identical to docker-compose.qudossl.yml except OPENSSL_CONF points at the FIPS
+# provider config (FIPS + base providers, fips=yes properties). TLS is served by
+# the OpenSSL 3.5.4 validated FIPS module; the same ML-KEM hybrid groups are
+# negotiated. Uses the SAME image as the standard compose — only the config the
+# haproxy process loads changes.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qudossl-haproxy-demo-app:1.0.0
+    container_name: haproxy-demo-app
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  haproxy:
+    build:
+      context: .
+      dockerfile: haproxy/Dockerfile.qudossl
+    image: qudossl-haproxy-demo-proxy:1.0.0    # shared with the standard compose
+    container_name: haproxy-demo-proxy
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      # FIPS build: FIPS + base providers, fips=yes default properties.
+      OPENSSL_CONF: /opt/qudossl/ssl/qudossl-fips.cnf
+    ports:
+      - "443:443"
+    volumes:
+      - ./haproxy/haproxy.qudossl.cfg:/etc/haproxy/haproxy.cfg:ro
+      - ./certs:/etc/haproxy/certs:ro
+    restart: unless-stopped

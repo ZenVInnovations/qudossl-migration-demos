@@ -1,0 +1,122 @@
+# QudoSSL-enabled HAProxy image — post-quantum TLS termination.
+#
+# Builds QudoSSL Commercial 1.0.0 from the PUBLIC source release (standard + FIPS),
+# then builds HAProxy against it, exactly as the migration handbook documents. The
+# result is a haproxy binary linked to QudoSSL's OpenSSL 3.5.7, which offers ML-KEM
+# hybrid key exchange. Nothing here is invented — the flags are the handbook's.
+#
+# First build is slow (~15-20 min: it compiles OpenSSL 3.5.7 + HAProxy); it caches
+# afterwards. Override versions/URL with build args if needed.
+
+ARG QUDOSSL_VERSION=1.0.0
+ARG HAPROXY_VERSION=3.0.6
+
+# --- build stage: QudoSSL + HAProxy -----------------------------------------
+FROM debian:12 AS build
+ARG QUDOSSL_VERSION
+ARG HAPROXY_VERSION
+ARG QUDOSSL_PREFIX=/opt/qudossl
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential libpcre2-dev zlib1g-dev perl curl ca-certificates gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# 1. Download, verify, and build QudoSSL Commercial (standard + FIPS).
+RUN set -eux; \
+    base="https://github.com/ZenVInnovations/qudossl-commercial/releases/download/qudossl-commercial-${QUDOSSL_VERSION}"; \
+    curl -fsSLO "$base/qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz"; \
+    curl -fsSLO "$base/qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz.sha256"; \
+    curl -fsSLO "$base/qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz.asc"; \
+    curl -fsSLO "$base/qudossl-commercial-release-key.asc"; \
+    sha256sum -c "qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz.sha256"; \
+    gpg --quiet --import qudossl-commercial-release-key.asc; \
+    gpg --verify "qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz.asc" "qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz"; \
+    tar xf "qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz"
+
+RUN set -eux; \
+    cd "qudossl-commercial-${QUDOSSL_VERSION}"; \
+    make -C build all PREFIX="${QUDOSSL_PREFIX}" \
+      EXTRA_FLAGS="-Wl,-rpath,${QUDOSSL_PREFIX}/lib" JOBS="$(nproc)"; \
+    make -C build install_sw   PREFIX="${QUDOSSL_PREFIX}"; \
+    make -C build install_fips PREFIX="${QUDOSSL_PREFIX}"
+
+# Two provider configs, selected at runtime via OPENSSL_CONF (verbatim from the
+# QudoSSL installation handbook). openssl.cnf → standard; qudossl-fips.cnf → FIPS.
+RUN mkdir -p ${QUDOSSL_PREFIX}/ssl \
+    && cat > ${QUDOSSL_PREFIX}/ssl/openssl.cnf <<'CNF'
+openssl_conf = openssl_init
+[openssl_init]
+providers = provider_sect
+[provider_sect]
+default = default_sect
+[default_sect]
+activate = 1
+CNF
+RUN cat > ${QUDOSSL_PREFIX}/ssl/qudossl-fips.cnf <<'CNF'
+# FIPS provider configuration for QudoSSL Commercial.
+# ORDER MATTERS: the global `openssl_conf` directive must come BEFORE the
+# .include, because the included fipsmodule.cnf ends inside its [fips_sect]
+# section — anything after it would be swallowed into that section and ignored.
+# config_diagnostics=1 makes a bad config fail loudly instead of silently
+# falling back to the default provider.
+config_diagnostics = 1
+openssl_conf = openssl_init
+
+# The .include path is ABSOLUTE — it must match the install prefix.
+.include /opt/qudossl/ssl/fipsmodule.cnf
+
+[openssl_init]
+providers   = provider_sect
+alg_section = algorithm_sect
+
+[provider_sect]
+fips = fips_sect
+base = base_sect
+
+[base_sect]
+activate = 1
+
+[algorithm_sect]
+default_properties = fips=yes
+CNF
+RUN test -f ${QUDOSSL_PREFIX}/ssl/fipsmodule.cnf \
+    || { echo "FATAL: fipsmodule.cnf missing — install_fips failed"; exit 1; }
+
+# 2. Build HAProxy against QudoSSL (handbook flags: RPATH is mandatory).
+RUN set -eux; \
+    curl -fsSLO "https://www.haproxy.org/download/${HAPROXY_VERSION%.*}/src/haproxy-${HAPROXY_VERSION}.tar.gz"; \
+    tar xf "haproxy-${HAPROXY_VERSION}.tar.gz"; \
+    cd "haproxy-${HAPROXY_VERSION}"; \
+    make -j"$(nproc)" TARGET=linux-glibc USE_OPENSSL=1 \
+      SSL_INC="${QUDOSSL_PREFIX}/include" SSL_LIB="${QUDOSSL_PREFIX}/lib" \
+      LDFLAGS="-Wl,-rpath,${QUDOSSL_PREFIX}/lib"; \
+    make install PREFIX=/usr/local; \
+    # GATE: fail the build if haproxy did not link QudoSSL.
+    ldd /usr/local/sbin/haproxy | grep -E 'libssl|libcrypto' \
+      | grep -q "${QUDOSSL_PREFIX}/lib" \
+      || { echo "FATAL: haproxy is not linked against QudoSSL"; exit 1; }
+
+# --- runtime stage ----------------------------------------------------------
+FROM debian:12-slim
+ARG QUDOSSL_PREFIX=/opt/qudossl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libpcre2-8-0 zlib1g curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/qudossl /opt/qudossl
+COPY --from=build /usr/local/sbin/haproxy /usr/local/sbin/haproxy
+
+# Provider config for the haproxy process (standard build → default provider).
+# The FIPS compose overrides OPENSSL_CONF to qudossl-fips.cnf.
+ENV OPENSSL_CONF=/opt/qudossl/ssl/openssl.cnf
+ENV OPENSSL_MODULES=/opt/qudossl/lib/ossl-modules
+ENV PATH="/opt/qudossl/bin:/usr/local/sbin:${PATH}"
+
+RUN mkdir -p /etc/haproxy/certs
+EXPOSE 443
+STOPSIGNAL SIGUSR1
+
+# haproxy is configured via the mounted /etc/haproxy/haproxy.cfg (compose mount).
+CMD ["haproxy", "-f", "/etc/haproxy/haproxy.cfg"]

@@ -1,0 +1,137 @@
+# QudoSSL-enabled NGINX image — post-quantum TLS termination.
+#
+# Builds QudoSSL Commercial 1.0.0 from the PUBLIC source release, then builds
+# NGINX against it, exactly as the migration handbook documents. The result is
+# an nginx binary linked to QudoSSL's OpenSSL 3.5.7, which offers ML-KEM hybrid
+# key exchange. Nothing here is invented — the flags are the handbook's.
+#
+# First build is slow (~15-20 min: it compiles OpenSSL 3.5.7 + nginx); it caches
+# afterwards. Override the version/URL with build args if needed.
+
+ARG QUDOSSL_VERSION=1.0.0
+ARG NGINX_VERSION=1.27.2
+
+# --- build stage: QudoSSL + nginx -------------------------------------------
+FROM debian:12 AS build
+ARG QUDOSSL_VERSION
+ARG NGINX_VERSION
+ARG QUDOSSL_PREFIX=/opt/qudossl
+ARG QUDOSSL_TARBALL_URL=https://github.com/ZenVInnovations/qudossl-commercial/releases/download/qudossl-commercial-${QUDOSSL_VERSION}/qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential libpcre2-dev zlib1g-dev perl curl ca-certificates gnupg wget \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# 1. Download, verify, and build QudoSSL Commercial (standard build).
+RUN set -eux; \
+    base="https://github.com/ZenVInnovations/qudossl-commercial/releases/download/qudossl-commercial-${QUDOSSL_VERSION}"; \
+    curl -fsSLO "$base/qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz"; \
+    curl -fsSLO "$base/qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz.sha256"; \
+    curl -fsSLO "$base/qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz.asc"; \
+    curl -fsSLO "$base/qudossl-commercial-release-key.asc"; \
+    sha256sum -c "qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz.sha256"; \
+    gpg --quiet --import qudossl-commercial-release-key.asc; \
+    gpg --verify "qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz.asc" "qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz"; \
+    tar xf "qudossl-commercial-${QUDOSSL_VERSION}-src.tar.gz"
+
+RUN set -eux; \
+    cd "qudossl-commercial-${QUDOSSL_VERSION}"; \
+    make -C build all PREFIX="${QUDOSSL_PREFIX}" \
+      EXTRA_FLAGS="-Wl,-rpath,${QUDOSSL_PREFIX}/lib" JOBS="$(nproc)"; \
+    make -C build install_sw   PREFIX="${QUDOSSL_PREFIX}"; \
+    make -C build install_fips PREFIX="${QUDOSSL_PREFIX}"
+# install_sw ships the OpenSSL 3.5.7 libraries + default/base providers.
+# install_fips runs `openssl fipsinstall`, dropping the validated FIPS module
+# (fips.so) and its self-test config at ${QUDOSSL_PREFIX}/ssl/fipsmodule.cnf.
+
+# Two provider configs, selected at runtime via OPENSSL_CONF:
+#   openssl.cnf      → STANDARD build: default provider (broad algorithm set).
+#   qudossl-fips.cnf → FIPS build: FIPS + base providers, fips=yes properties.
+# Both offer the ML-KEM hybrid groups; the migration line lives in nginx.conf.
+# Values here are copied verbatim from the QudoSSL installation handbook.
+RUN mkdir -p ${QUDOSSL_PREFIX}/ssl \
+    && cat > ${QUDOSSL_PREFIX}/ssl/openssl.cnf <<'CNF'
+openssl_conf = openssl_init
+[openssl_init]
+providers = provider_sect
+[provider_sect]
+default = default_sect
+[default_sect]
+activate = 1
+CNF
+RUN cat > ${QUDOSSL_PREFIX}/ssl/qudossl-fips.cnf <<'CNF'
+# FIPS provider configuration for QudoSSL Commercial.
+# ORDER MATTERS: the global `openssl_conf` directive must come BEFORE the
+# .include, because the included fipsmodule.cnf ends inside its [fips_sect]
+# section — anything after it would be swallowed into that section and ignored.
+# config_diagnostics=1 makes a bad config fail loudly instead of silently
+# falling back to the default provider.
+config_diagnostics = 1
+openssl_conf = openssl_init
+
+# The .include path is ABSOLUTE — it must match the install prefix.
+.include /opt/qudossl/ssl/fipsmodule.cnf
+
+[openssl_init]
+providers   = provider_sect
+alg_section = algorithm_sect
+
+[provider_sect]
+fips = fips_sect
+base = base_sect
+
+[base_sect]
+activate = 1
+
+[algorithm_sect]
+default_properties = fips=yes
+CNF
+# Fail early if the FIPS module self-test config was not produced.
+RUN test -f ${QUDOSSL_PREFIX}/ssl/fipsmodule.cnf \
+    || { echo "FATAL: fipsmodule.cnf missing — install_fips failed"; exit 1; }
+
+# 2. Build NGINX against QudoSSL (handbook flags: RPATH is mandatory).
+RUN set -eux; \
+    curl -fsSLO "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"; \
+    tar xf "nginx-${NGINX_VERSION}.tar.gz"; \
+    cd "nginx-${NGINX_VERSION}"; \
+    ./configure \
+      --prefix=/usr/local/nginx \
+      --with-http_ssl_module --with-http_v2_module \
+      --with-cc-opt="-I${QUDOSSL_PREFIX}/include -O2 -g" \
+      --with-ld-opt="-L${QUDOSSL_PREFIX}/lib -lssl -lcrypto -Wl,-rpath,${QUDOSSL_PREFIX}/lib"; \
+    make -j"$(nproc)"; \
+    make install; \
+    # GATE: fail the build if nginx did not link QudoSSL.
+    ldd /usr/local/nginx/sbin/nginx | grep -E 'libssl|libcrypto' \
+      | grep -q "${QUDOSSL_PREFIX}/lib" \
+      || { echo "FATAL: nginx is not linked against QudoSSL"; exit 1; }
+
+# --- runtime stage ----------------------------------------------------------
+FROM debian:12-slim
+ARG QUDOSSL_PREFIX=/opt/qudossl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libpcre2-8-0 zlib1g curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/qudossl /opt/qudossl
+COPY --from=build /usr/local/nginx /usr/local/nginx
+
+# Provider config for the nginx process (standard build → default provider).
+ENV OPENSSL_CONF=/opt/qudossl/ssl/openssl.cnf
+ENV OPENSSL_MODULES=/opt/qudossl/lib/ossl-modules
+ENV PATH="/opt/qudossl/bin:/usr/local/nginx/sbin:${PATH}"
+
+# The same nginx.conf serves both images, so mime.types must live where the
+# stock image keeps it (/etc/nginx). A source build ships it under
+# /usr/local/nginx/conf — copy it across. Make log/temp dirs worker-writable.
+RUN mkdir -p /var/log/nginx /etc/nginx/conf.d /etc/nginx/certs \
+    && cp /usr/local/nginx/conf/mime.types /etc/nginx/mime.types \
+    && chown -R nobody:nogroup /var/log/nginx /usr/local/nginx/*_temp 2>/dev/null || true
+EXPOSE 443
+STOPSIGNAL SIGQUIT
+
+# nginx is configured via the mounted /etc/nginx/nginx.conf (compose bind-mount).
+CMD ["nginx", "-c", "/etc/nginx/nginx.conf", "-g", "daemon off;"]

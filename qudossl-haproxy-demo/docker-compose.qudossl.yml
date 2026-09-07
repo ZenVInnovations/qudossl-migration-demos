@@ -1,0 +1,42 @@
+# AFTER (STANDARD build) — post-quantum TLS termination on QudoSSL.
+#
+#   docker compose -f docker-compose.qudossl.yml up -d --build
+#   ./scripts/verify-qudossl.sh
+#
+# Same Spring Boot app, same certificate. The ONLY difference from the baseline
+# is the HAProxy image: it is BUILT AGAINST QudoSSL (haproxy/Dockerfile.qudossl)
+# and loads the STANDARD provider config, so it offers the ML-KEM hybrid groups.
+# The one added config line lives in haproxy/haproxy.qudossl.cfg.
+#
+# For the FIPS build instead, use docker-compose.qudossl-fips.yml.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qudossl-haproxy-demo-app:1.0.0
+    container_name: haproxy-demo-app
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  haproxy:
+    build:
+      context: .
+      dockerfile: haproxy/Dockerfile.qudossl
+    image: qudossl-haproxy-demo-proxy:1.0.0    # shared with the FIPS compose
+    container_name: haproxy-demo-proxy
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      # STANDARD build: default provider. (FIPS compose overrides this.)
+      OPENSSL_CONF: /opt/qudossl/ssl/openssl.cnf
+    ports:
+      - "443:443"
+    volumes:
+      # The QudoSSL config is mounted as the active haproxy.cfg.
+      - ./haproxy/haproxy.qudossl.cfg:/etc/haproxy/haproxy.cfg:ro
+      - ./certs:/etc/haproxy/certs:ro
+    restart: unless-stopped

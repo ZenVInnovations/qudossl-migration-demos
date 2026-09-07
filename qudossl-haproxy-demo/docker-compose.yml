@@ -1,0 +1,33 @@
+# BEFORE — baseline stack on STOCK OpenSSL (no QudoSSL, no post-quantum TLS).
+#
+#   docker compose up -d --build
+#   curl -k https://localhost/
+#
+# HAProxy (official image, linked against the distro's classical-only OpenSSL)
+# terminates TLS and proxies plain HTTP to the Spring Boot app on :8080.
+# This is the state a customer starts from. Bring it up, confirm it works,
+# THEN migrate with docker-compose.qudossl.yml.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qudossl-haproxy-demo-app:1.0.0
+    container_name: haproxy-demo-app
+    expose:
+      - "8080"          # HTTP only, reachable to haproxy on the internal network
+    restart: unless-stopped
+
+  haproxy:
+    image: haproxy:3.0
+    container_name: haproxy-demo-proxy
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "443:443"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./certs:/etc/haproxy/certs:ro
+    restart: unless-stopped
