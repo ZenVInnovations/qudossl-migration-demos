@@ -216,16 +216,25 @@ protection. That is exactly what you want during a migration.
 
 ### How do I see the negotiated group with HAProxy?
 
-Unlike NGINX (`$ssl_curve`), **HAProxy has no sample fetch for the negotiated
-key-exchange group**, so there is no `X-TLS-Group` header to read. Use
-`scripts/verify-tls.sh` / `verify-qudossl.sh`, which run a QudoSSL TLS client
-inside the proxy container and print `Negotiated TLS1.3 group: X25519MLKEM768`.
-That is the authoritative check. HAProxy *can* surface the protocol and cipher
-(`%[ssl_fc_protocol]`, `%[ssl_fc_cipher]`), which this demo exposes as headers.
+HAProxy exposes the key-exchange group via the `%[ssl_fc_curve]` sample fetch,
+which this demo surfaces as the `X-TLS-Group` response header. It reflects the
+group **this client** negotiated, and — unlike NGINX's `$ssl_curve`, which
+prints a codepoint — HAProxy prints the readable **name**:
 
-> Also note: HAProxy's `http-request set-header` adds headers toward the
-> **backend**; to surface TLS info to the **client** you must use
-> `http-response set-header`, as this demo's config does.
+```
+X-TLS-Group: SECP256R1          ← from a classical client (curl, most browsers)
+X-TLS-Group: X25519MLKEM768     ← from a PQC-capable client
+```
+
+So `curl -skI https://localhost/` shows `SECP256R1` even though the server
+offers ML-KEM first — that is post-quantum readiness with a safe classical
+fallback (Supported ≠ Negotiated), not a misconfiguration. The authoritative
+check remains `scripts/verify-qudossl.sh` (an in-container QudoSSL `s_client`
+that offers the hybrid and prints `Negotiated TLS1.3 group: X25519MLKEM768`).
+
+> Note the header **direction**: HAProxy's `http-request set-header` adds
+> headers toward the **backend**; to surface TLS info to the **client** you must
+> use `http-response set-header`, as this demo's config does.
 
 ---
 
