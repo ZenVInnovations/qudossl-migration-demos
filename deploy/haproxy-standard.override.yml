@@ -1,0 +1,21 @@
+# Hosted-endpoint override for the HAProxy demo (standard build). See deploy/README.md.
+#
+#   cd qudossl-haproxy-demo
+#   docker compose -f docker-compose.qudossl.yml -f ../deploy/haproxy-standard.override.yml up -d --build
+#
+# The proxy still binds 443 inside the container; here it is published on a host
+# loopback port so a front proxy can pass TLS through by SNI. Bind it to a routable
+# address instead if the demo gets its own IP.
+
+services:
+  app:
+    mem_limit: 512m
+    cpus: 0.5
+    restart: unless-stopped
+
+  haproxy:
+    ports: !override
+      - "127.0.0.1:${HAPROXY_DEMO_PORT:-8445}:443"
+    mem_limit: 256m
+    cpus: 0.5
+    restart: unless-stopped
