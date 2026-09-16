@@ -44,6 +44,9 @@ Override `WEBROOT`, `NGINX_DEMO_PORT` or `HAPROXY_DEMO_PORT` if the defaults don
 
 ## Verify from a client machine, not from the host
 
+Full check-list, including how to tell the FIPS build from the standard one from
+outside: [VERIFICATION.md](VERIFICATION.md).
+
 Checking from the host itself can hairpin through local routing and report the wrong
 group.
 
